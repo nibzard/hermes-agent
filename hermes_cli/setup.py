@@ -652,7 +652,7 @@ def _print_setup_summary(config: dict, hermes_home):
     else:
         tool_status.append(("Web Search & Extract", False, "EXA_API_KEY, PARALLEL_API_KEY, FIRECRAWL_API_KEY/FIRECRAWL_API_URL, or TAVILY_API_KEY"))
 
-    # Browser tools (local Chromium, Camofox, Browserbase, or Browser Use)
+    # Browser tools (local Chromium, Camofox, Browserbase, Browser Use, or Steel)
     browser_provider = subscription_features.browser.current_provider
     if subscription_features.browser.managed_by_nous:
         tool_status.append(("Browser Automation (Nous Browserbase)", True, None))
@@ -671,6 +671,10 @@ def _print_setup_summary(config: dict, hermes_home):
         elif browser_provider == "Browser Use":
             missing_browser_hint = (
                 "npm install -g agent-browser and set BROWSER_USE_API_KEY"
+            )
+        elif browser_provider == "Steel":
+            missing_browser_hint = (
+                "npm install -g agent-browser and set STEEL_API_KEY"
             )
         elif browser_provider == "Camofox":
             missing_browser_hint = "CAMOFOX_URL"
