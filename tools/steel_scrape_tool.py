@@ -18,6 +18,7 @@ import os
 from typing import Optional
 
 import requests
+from tools.url_safety import is_safe_url as _is_safe_url
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,11 @@ def steel_scrape(
     Returns:
         JSON string with extracted content, metadata, and links.
     """
+    if not _is_safe_url(url):
+        return json.dumps({
+            "error": "Blocked: URL targets a private or internal address",
+        })
+
     api_key = os.environ.get("STEEL_API_KEY")
     if not api_key:
         return json.dumps({"error": "STEEL_API_KEY not configured"})
