@@ -1,20 +1,37 @@
-# ABOUTME: Live API tests for the Steel cloud browser provider.
-# ABOUTME: Requires STEEL_API_KEY env var; skipped when not set.
+# ABOUTME: Tests for the Steel cloud browser provider and steel_scrape tool.
+# ABOUTME: Live integration tests require STEEL_API_KEY + the steel CLI on PATH.
 """Tests for tools.browser_providers.steel — Steel cloud browser provider.
 
-These tests hit the real Steel API.  They are skipped when ``STEEL_API_KEY``
-is not set (e.g. in CI without credentials).
+Browser-automation sessions go through the Steel CLI (``steel browser ...``);
+unit tests below mock the CLI subprocess. Live integration tests are skipped
+unless ``STEEL_API_KEY`` is set in the host shell **and** the ``steel`` CLI is
+on PATH.
 """
 
 import json
 import os
+import shutil
+from unittest.mock import patch, MagicMock
+
 import pytest
 
-_HAS_STEEL_KEY = bool(os.environ.get("STEEL_API_KEY"))
-requires_steel = pytest.mark.skipif(
-    not _HAS_STEEL_KEY,
-    reason="STEEL_API_KEY not set — skipping live Steel tests",
-)
+
+# Capture the real STEEL_API_KEY at module import — before tests/conftest.py's
+# autouse `_hermetic_environment` fixture blanks it. Integration tests use the
+# `live_steel` fixture below to restore the captured key (and skip when
+# unavailable), so the credential never has to leak through the hermetic env.
+_REAL_STEEL_API_KEY = os.environ.get("STEEL_API_KEY") or ""
+_HAS_STEEL_CLI = shutil.which("steel") is not None
+
+
+@pytest.fixture
+def live_steel(monkeypatch):
+    """Restore the real STEEL_API_KEY for live integration tests, or skip."""
+    if not _REAL_STEEL_API_KEY:
+        pytest.skip("STEEL_API_KEY not set — skipping live Steel tests")
+    if not _HAS_STEEL_CLI:
+        pytest.skip("steel CLI not on PATH — skipping live Steel tests")
+    monkeypatch.setenv("STEEL_API_KEY", _REAL_STEEL_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -77,14 +94,6 @@ class TestSteelProviderUnit:
         assert headers["Steel-Api-Key"] == "sk-test-123"
         assert headers["Content-Type"] == "application/json"
 
-    def test_emergency_cleanup_missing_key_returns_silently(self, monkeypatch):
-        monkeypatch.delenv("STEEL_API_KEY", raising=False)
-        from tools.browser_providers.steel import SteelProvider
-
-        provider = SteelProvider()
-        # Should not raise
-        provider.emergency_cleanup("nonexistent-session-id")
-
     def test_registered_in_provider_registry(self):
         from tools.browser_tool import _PROVIDER_REGISTRY
         from tools.browser_providers.steel import SteelProvider
@@ -92,57 +101,110 @@ class TestSteelProviderUnit:
         assert "steel" in _PROVIDER_REGISTRY
         assert _PROVIDER_REGISTRY["steel"] is SteelProvider
 
+    def test_create_session_raises_with_install_hint_when_cli_missing(self, monkeypatch):
+        """If steel CLI is not on PATH, create_session must raise an actionable error."""
+        from tools.browser_providers import steel as steel_mod
+        from tools.browser_providers.steel import SteelProvider
+
+        monkeypatch.setenv("STEEL_API_KEY", "test-key")
+        monkeypatch.setattr(steel_mod, "_find_steel_cli", lambda: None)
+
+        with pytest.raises(RuntimeError, match=r"Steel CLI not found"):
+            SteelProvider().create_session("task-1")
+
+    def test_install_hint_includes_setup_url(self):
+        from tools.browser_providers.steel import _STEEL_CLI_INSTALL_HINT
+
+        assert "setup.steel.dev" in _STEEL_CLI_INSTALL_HINT
+        assert "@steel-dev/cli" in _STEEL_CLI_INSTALL_HINT
+
+    def test_create_session_invokes_steel_cli(self, monkeypatch):
+        """create_session shells out to ``steel browser start --session <name>``."""
+        from tools.browser_providers import steel as steel_mod
+        from tools.browser_providers.steel import SteelProvider
+
+        monkeypatch.setenv("STEEL_API_KEY", "test-key")
+        monkeypatch.setattr(steel_mod, "_find_steel_cli", lambda: "/fake/steel")
+
+        fake_cli_response = MagicMock(
+            returncode=0,
+            stdout=json.dumps({
+                "success": True,
+                "data": {
+                    "id": "abc-123",
+                    "name": "ignored-by-us",
+                    "liveUrl": "https://app.steel.dev/sessions/abc-123",
+                    "mode": "cloud",
+                },
+            }),
+            stderr="",
+        )
+        with patch.object(steel_mod.subprocess, "run", return_value=fake_cli_response) as mocked:
+            session = SteelProvider().create_session("task-X")
+
+        # Verify the CLI command shape
+        args, _ = mocked.call_args
+        cmd = args[0]
+        assert cmd[0] == "/fake/steel"
+        assert cmd[1:4] == ["browser", "start", "--session"]
+        assert cmd[4].startswith("hermes_task-X_")
+        assert cmd[-1] == "--json"
+
+        # Verify the session record we expose to browser_tool.py
+        assert session["uses_steel_cli"] is True
+        assert "cdp_url" not in session
+        assert session["session_name"].startswith("hermes_task-X_")
+        assert session["bb_session_id"] == session["session_name"]
+        assert session["features"] == {"steel": True}
+        assert session["steel_cloud_session_id"] == "abc-123"
+        assert session["session_viewer_url"] == "https://app.steel.dev/sessions/abc-123"
+
+    def test_close_session_invokes_steel_cli_stop(self, monkeypatch):
+        from tools.browser_providers import steel as steel_mod
+        from tools.browser_providers.steel import SteelProvider
+
+        monkeypatch.setattr(steel_mod, "_find_steel_cli", lambda: "/fake/steel")
+        fake = MagicMock(returncode=0, stdout=json.dumps({"success": True, "data": {}}), stderr="")
+        with patch.object(steel_mod.subprocess, "run", return_value=fake) as mocked:
+            ok = SteelProvider().close_session("hermes_task_abcdef")
+
+        assert ok is True
+        cmd = mocked.call_args[0][0]
+        assert cmd[1:5] == ["browser", "stop", "--session", "hermes_task_abcdef"]
+
+    def test_emergency_cleanup_swallows_errors(self, monkeypatch):
+        from tools.browser_providers import steel as steel_mod
+        from tools.browser_providers.steel import SteelProvider
+
+        monkeypatch.setattr(steel_mod, "_find_steel_cli", lambda: None)
+        # Should not raise even when CLI is absent
+        SteelProvider().emergency_cleanup("hermes_task_abcdef")
+
 
 # ---------------------------------------------------------------------------
-# Integration tests — real API calls
+# Live integration tests — real Steel CLI + real Steel API
 # ---------------------------------------------------------------------------
 
 
-@requires_steel
 class TestSteelProviderIntegration:
-    """Tests that create/release real Steel sessions."""
+    """Tests that create/release real Steel sessions via the steel CLI."""
 
-    def test_create_and_release_session(self):
+    def test_create_and_release_session(self, live_steel):
         from tools.browser_providers.steel import SteelProvider
 
         provider = SteelProvider()
         session = provider.create_session("test_integration")
-
-        # Validate returned structure
-        assert "session_name" in session
-        assert session["session_name"].startswith("hermes_test_integration_")
-        assert "bb_session_id" in session
-        assert session["bb_session_id"]  # non-empty
-        assert "cdp_url" in session
-        assert session["cdp_url"].startswith("wss://connect.steel.dev")
-        assert "features" in session
-        assert session["features"]["steel"] is True
-
-        # Steel returns a live session viewer URL
-        if session.get("session_viewer_url"):
-            assert "steel.dev" in session["session_viewer_url"] or "http" in session["session_viewer_url"]
-
-        # Release the session
-        released = provider.close_session(session["bb_session_id"])
-        assert released is True
-
-    def test_close_nonexistent_session_returns_true(self):
-        """Closing an already-gone session should not fail."""
-        from tools.browser_providers.steel import SteelProvider
-
-        provider = SteelProvider()
-        # Steel requires valid UUID format for session IDs
-        result = provider.close_session("00000000-0000-0000-0000-000000000000")
-        # 404 is treated as success (session already gone)
-        assert result is True
-
-    def test_emergency_cleanup_nonexistent_session(self):
-        """Emergency cleanup should not raise even for bad session IDs."""
-        from tools.browser_providers.steel import SteelProvider
-
-        provider = SteelProvider()
-        # Should not raise — Steel requires valid UUID format
-        provider.emergency_cleanup("00000000-0000-0000-0000-000000000000")
+        try:
+            assert session["session_name"].startswith("hermes_test_integration_")
+            assert session["bb_session_id"] == session["session_name"]
+            assert session["uses_steel_cli"] is True
+            assert "cdp_url" not in session
+            assert session["features"]["steel"] is True
+            if session.get("session_viewer_url"):
+                assert "steel.dev" in session["session_viewer_url"]
+            assert session.get("steel_cloud_session_id"), "expected cloud session id"
+        finally:
+            assert provider.close_session(session["bb_session_id"]) is True
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +214,13 @@ class TestSteelProviderIntegration:
 
 class TestSteelScrapeUnit:
     """Tests for the scrape tool that don't need an API key."""
+
+    def test_scrape_blocks_private_urls_before_network(self, monkeypatch):
+        monkeypatch.setenv("STEEL_API_KEY", "test-key")
+        from tools.steel_scrape_tool import steel_scrape
+
+        result = json.loads(steel_scrape("http://127.0.0.1:8000"))
+        assert result == {"error": "Blocked: URL targets a private or internal address"}
 
     def test_scrape_returns_error_without_key(self, monkeypatch):
         monkeypatch.delenv("STEEL_API_KEY", raising=False)
@@ -181,11 +250,16 @@ class TestSteelScrapeUnit:
         assert registry.get_toolset_for_tool("steel_scrape") == "browser"
 
 
-@requires_steel
 class TestSteelScrapeIntegration:
-    """Live API tests for Steel scrape."""
+    """Live API tests for Steel scrape (no CLI needed — pure HTTP)."""
 
-    def test_scrape_returns_markdown(self):
+    def _scrape_live(self, monkeypatch):
+        if not _REAL_STEEL_API_KEY:
+            pytest.skip("STEEL_API_KEY not set — skipping live Steel scrape tests")
+        monkeypatch.setenv("STEEL_API_KEY", _REAL_STEEL_API_KEY)
+
+    def test_scrape_returns_markdown(self, monkeypatch):
+        self._scrape_live(monkeypatch)
         from tools.steel_scrape_tool import steel_scrape
 
         result = json.loads(steel_scrape("https://example.com", format="markdown"))
@@ -193,39 +267,9 @@ class TestSteelScrapeIntegration:
         assert "content" in result
         assert len(result["content"]) > 0
 
-    def test_scrape_returns_metadata(self):
+    def test_scrape_returns_metadata(self, monkeypatch):
+        self._scrape_live(monkeypatch)
         from tools.steel_scrape_tool import steel_scrape
 
         result = json.loads(steel_scrape("https://example.com"))
         assert "title" in result or "content" in result
-
-
-# ---------------------------------------------------------------------------
-# End-to-end test — full session lifecycle with CDP URL validation
-# ---------------------------------------------------------------------------
-
-
-@requires_steel
-class TestSteelProviderE2E:
-    """Full lifecycle test: create session, validate CDP URL format, release."""
-
-    def test_full_lifecycle(self):
-        from tools.browser_providers.steel import SteelProvider
-
-        provider = SteelProvider()
-        api_key = os.environ["STEEL_API_KEY"]
-
-        # Create
-        session = provider.create_session("e2e_test")
-        session_id = session["bb_session_id"]
-        cdp_url = session["cdp_url"]
-
-        # Validate CDP URL contains the API key and session ID
-        assert f"apiKey={api_key}" in cdp_url
-        assert f"sessionId={session_id}" in cdp_url
-
-        # Release
-        assert provider.close_session(session_id) is True
-
-        # Double-release should also succeed (404 → True)
-        assert provider.close_session(session_id) is True
